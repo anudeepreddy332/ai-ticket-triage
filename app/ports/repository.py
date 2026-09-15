@@ -7,4 +7,3 @@ class TriageResultRepository(Protocol):
     def save(self, result: TriageResult) -> None:
         """Persist a completed triage result."""
         ...
-
