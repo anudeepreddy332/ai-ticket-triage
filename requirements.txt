@@ -1,0 +1,1 @@
+# Runtime dependencies will be generated/managed when AWS adapters are introduced.
