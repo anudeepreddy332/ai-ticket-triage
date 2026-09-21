@@ -8,3 +8,6 @@ class ClassifierUnavailableError(ClassificationError):
 
 class ClassifierResponseError(ClassificationError):
     """The classifier returned an unusable or invalid response."""
+
+class ClassificationBlockedError(ClassificationError):
+    """Classification was blocked by a safety or policy control."""

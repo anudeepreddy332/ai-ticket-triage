@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ from app.core.models import (
     TicketCategory,
 )
 from app.ports.errors import (
+    ClassificationBlockedError,
     ClassifierResponseError,
     ClassifierUnavailableError,
 )
@@ -52,6 +54,7 @@ def make_ticket() -> SupportTicket:
 def test_bedrock_classifier_returns_structured_result() -> None:
     client = FakeBedrockClient(
         response={
+            "stopReason": "end_turn",
             "output": {
                 "message": {
                     "content": [
@@ -95,6 +98,7 @@ def test_bedrock_classifier_returns_structured_result() -> None:
 def test_bedrock_classifier_does_not_send_customer_id() -> None:
     client = FakeBedrockClient(
         response={
+            "stopReason": "end_turn",
             "output": {
                 "message": {
                     "content": [
@@ -183,6 +187,186 @@ def test_bedrock_classifier_rejects_invalid_domain_values() -> None:
                                         "category": "payments",
                                         "summary": "Invalid severity.",
                                         "confidence": 1.4,
+                                    }
+                                )
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        model_id="openai.gpt-oss-120b-1:0",
+    )
+
+    with pytest.raises(ClassifierResponseError):
+        classifier.classify(make_ticket())
+
+def test_bedrock_classifier_adds_guardrail_configuration() -> None:
+    client = FakeBedrockClient(
+        response={
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 20,
+                "outputTokens": 10,
+                "totalTokens": 30,
+            },
+            "metrics": {
+                "latencyMs": 100,
+            },
+            "output": {
+                "message": {
+                    "content": [
+                        {
+                            "text": json.dumps(
+                                {
+                                    "severity": "P3",
+                                    "category": "technical",
+                                    "summary": "Technical issue.",
+                                    "confidence": 0.8,
+                                }
+                            )
+                        }
+                    ]
+                }
+            },
+        }
+    )
+
+    classifier = BedrockTicketClassifier(
+        client=client,
+        model_id="openai.gpt-oss-120b-1:0",
+        guardrail_id="guardrail-123",
+        guardrail_version="1",
+    )
+
+    classifier.classify(make_ticket())
+
+    assert client.calls[0]["guardrailConfig"] == {
+        "guardrailIdentifier": "guardrail-123",
+        "guardrailVersion": "1",
+        "trace": "enabled",
+    }
+
+
+@pytest.mark.parametrize(
+    ("guardrail_id", "guardrail_version"),
+    [
+        ("guardrail-123", None),
+        (None, "1"),
+    ],
+)
+def test_bedrock_classifier_rejects_incomplete_guardrail_configuration(
+    guardrail_id: str | None,
+    guardrail_version: str | None,
+) -> None:
+    with pytest.raises(ValueError):
+        BedrockTicketClassifier(
+            client=FakeBedrockClient(),
+            model_id="openai.gpt-oss-120b-1:0",
+            guardrail_id=guardrail_id,
+            guardrail_version=guardrail_version,
+        )
+
+
+def test_bedrock_classifier_raises_when_guardrail_intervenes() -> None:
+    classifier = BedrockTicketClassifier(
+        client=FakeBedrockClient(
+            response={
+                "stopReason": "guardrail_intervened",
+                "usage": {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "totalTokens": 0,
+                },
+                "metrics": {
+                    "latencyMs": 50,
+                },
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": "Request blocked.",
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        model_id="openai.gpt-oss-120b-1:0",
+    )
+
+    with pytest.raises(ClassificationBlockedError):
+        classifier.classify(make_ticket())
+
+
+def test_bedrock_classifier_logs_safe_operational_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = FakeBedrockClient(
+        response={
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 20,
+                "outputTokens": 10,
+                "totalTokens": 30,
+            },
+            "metrics": {
+                "latencyMs": 100,
+            },
+            "output": {
+                "message": {
+                    "content": [
+                        {
+                            "text": json.dumps(
+                                {
+                                    "severity": "P3",
+                                    "category": "technical",
+                                    "summary": "Technical issue.",
+                                    "confidence": 0.8,
+                                }
+                            )
+                        }
+                    ]
+                }
+            },
+        }
+    )
+
+    classifier = BedrockTicketClassifier(
+        client=client,
+        model_id="openai.gpt-oss-120b-1:0",
+    )
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="app.adapters.aws.bedrock",
+    ):
+        classifier.classify(make_ticket())
+
+    logs = caplog.text
+
+    assert "bedrock_classification_succeeded" in logs
+    assert '"total_tokens": 30' in logs
+    assert '"bedrock_latency_ms": 100' in logs
+
+    assert "customer-secret-456" not in logs
+    assert "Payment outage" not in logs
+    assert "Checkout has returned" not in logs
+
+def test_bedrock_classifier_rejects_missing_stop_reason() -> None:
+    classifier = BedrockTicketClassifier(
+        client=FakeBedrockClient(
+            response={
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": json.dumps(
+                                    {
+                                        "severity": "P3",
+                                        "category": "technical",
+                                        "summary": "Technical issue.",
+                                        "confidence": 0.8,
                                     }
                                 )
                             }
