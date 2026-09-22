@@ -3,7 +3,9 @@ name = "ai-ticket-triage"
 version = "0.1.0"
 description = "Production-style asynchronous AI support ticket triage pipeline."
 requires-python = ">=3.14,<3.15"
-dependencies = []
+dependencies = [
+    "boto3>=1.43.95",
+]
 
 [dependency-groups]
 dev = [
@@ -11,6 +13,7 @@ dev = [
     "pytest-cov",
     "ruff",
     "mypy",
+    "boto3-stubs[bedrock-runtime]>=1.43.95",
 ]
 
 [tool.uv]
