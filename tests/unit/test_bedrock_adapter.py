@@ -17,6 +17,7 @@ from app.ports.errors import (
     ClassifierResponseError,
     ClassifierUnavailableError,
 )
+from app.ports.telemetry import ClassificationTelemetry
 
 
 class FakeBedrockClient:
@@ -380,3 +381,249 @@ def test_bedrock_classifier_rejects_missing_stop_reason() -> None:
 
     with pytest.raises(ClassifierResponseError):
         classifier.classify(make_ticket())
+
+class RecordingTelemetrySink:
+    def __init__(self) -> None:
+        self.events: list[ClassificationTelemetry] = []
+
+    def record(
+        self,
+        telemetry: ClassificationTelemetry,
+    ) -> None:
+        self.events.append(telemetry)
+
+
+class FailingTelemetrySink:
+    def record(
+        self,
+        telemetry: ClassificationTelemetry,
+    ) -> None:
+        raise RuntimeError("telemetry backend unavailable")
+
+
+def successful_response() -> dict[str, Any]:
+    return {
+        "stopReason": "end_turn",
+        "usage": {
+            "inputTokens": 100,
+            "outputTokens": 25,
+            "totalTokens": 125,
+        },
+        "metrics": {
+            "latencyMs": 250,
+        },
+        "output": {
+            "message": {
+                "content": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "severity": "P1",
+                                "category": "payments",
+                                "summary": "Checkout is unavailable.",
+                                "confidence": 0.98,
+                            }
+                        )
+                    }
+                ]
+            }
+        },
+    }
+
+
+def test_classifier_emits_success_telemetry() -> None:
+    sink = RecordingTelemetrySink()
+
+    classifier = BedrockTicketClassifier(
+        client=FakeBedrockClient(
+            response=successful_response()
+        ),
+        model_id="openai.gpt-oss-120b-1:0",
+        telemetry_sink=sink,
+    )
+
+    classifier.classify(make_ticket())
+
+    assert len(sink.events) == 1
+
+    event = sink.events[0]
+
+    assert event.outcome == "success"
+    assert event.stop_reason == "end_turn"
+    assert event.input_tokens == 100
+    assert event.output_tokens == 25
+    assert event.total_tokens == 125
+    assert event.model_latency_ms == 250
+    assert event.adapter_latency_ms >= 0
+
+
+def test_classifier_emits_unavailable_telemetry() -> None:
+    sink = RecordingTelemetrySink()
+
+    aws_error = ClientError(
+        {
+            "Error": {
+                "Code": "ThrottlingException",
+                "Message": "Rate exceeded",
+            }
+        },
+        "Converse",
+    )
+
+    classifier = BedrockTicketClassifier(
+        client=FakeBedrockClient(error=aws_error),
+        model_id="openai.gpt-oss-120b-1:0",
+        telemetry_sink=sink,
+    )
+
+    with pytest.raises(ClassifierUnavailableError):
+        classifier.classify(make_ticket())
+
+    assert len(sink.events) == 1
+    assert sink.events[0].outcome == "unavailable"
+    assert sink.events[0].stop_reason is None
+
+
+def test_classifier_emits_blocked_telemetry() -> None:
+    sink = RecordingTelemetrySink()
+
+    classifier = BedrockTicketClassifier(
+        client=FakeBedrockClient(
+            response={
+                "stopReason": "guardrail_intervened",
+                "usage": {
+                    "inputTokens": 30,
+                    "outputTokens": 0,
+                    "totalTokens": 30,
+                },
+                "metrics": {
+                    "latencyMs": 90,
+                },
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": "Blocked."
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        model_id="openai.gpt-oss-120b-1:0",
+        telemetry_sink=sink,
+    )
+
+    with pytest.raises(ClassificationBlockedError):
+        classifier.classify(make_ticket())
+
+    assert len(sink.events) == 1
+
+    event = sink.events[0]
+
+    assert event.outcome == "blocked"
+    assert event.stop_reason == "guardrail_intervened"
+
+
+def test_classifier_emits_incomplete_telemetry() -> None:
+    sink = RecordingTelemetrySink()
+
+    classifier = BedrockTicketClassifier(
+        client=FakeBedrockClient(
+            response={
+                "stopReason": "max_tokens",
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 512,
+                    "totalTokens": 612,
+                },
+                "metrics": {
+                    "latencyMs": 500,
+                },
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": "{}"
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        model_id="openai.gpt-oss-120b-1:0",
+        telemetry_sink=sink,
+    )
+
+    with pytest.raises(ClassifierResponseError):
+        classifier.classify(make_ticket())
+
+    assert len(sink.events) == 1
+
+    event = sink.events[0]
+
+    assert event.outcome == "incomplete"
+    assert event.stop_reason == "max_tokens"
+    assert event.output_tokens == 512
+
+
+def test_classifier_emits_invalid_response_telemetry() -> None:
+    sink = RecordingTelemetrySink()
+
+    classifier = BedrockTicketClassifier(
+        client=FakeBedrockClient(
+            response={
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 50,
+                    "outputTokens": 5,
+                    "totalTokens": 55,
+                },
+                "metrics": {
+                    "latencyMs": 100,
+                },
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": "not-json"
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        model_id="openai.gpt-oss-120b-1:0",
+        telemetry_sink=sink,
+    )
+
+    with pytest.raises(ClassifierResponseError):
+        classifier.classify(make_ticket())
+
+    assert len(sink.events) == 1
+    assert sink.events[0].outcome == "invalid_response"
+
+
+def test_telemetry_failure_does_not_break_classification(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    classifier = BedrockTicketClassifier(
+        client=FakeBedrockClient(
+            response=successful_response()
+        ),
+        model_id="openai.gpt-oss-120b-1:0",
+        telemetry_sink=FailingTelemetrySink(),
+    )
+
+    with caplog.at_level(
+        logging.ERROR,
+        logger="app.adapters.aws.bedrock",
+    ):
+        result = classifier.classify(make_ticket())
+
+    assert result.severity == Severity.P1
+
+    assert (
+        "classification_telemetry_sink_failed"
+        in caplog.text
+    )

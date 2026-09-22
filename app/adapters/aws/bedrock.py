@@ -20,6 +20,10 @@ from app.ports.errors import (
     ClassifierResponseError,
     ClassifierUnavailableError,
 )
+from app.ports.telemetry import (
+    ClassificationTelemetry,
+    ClassificationTelemetrySink,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_bedrock_runtime.client import BedrockRuntimeClient
@@ -119,6 +123,7 @@ class BedrockTicketClassifier:
         model_id: str,
         guardrail_id: str | None = None,
         guardrail_version: str | None = None,
+        telemetry_sink: ClassificationTelemetrySink | None = None,
     ) -> None:
         if (guardrail_id is None) != (guardrail_version is None):
             raise ValueError(
@@ -135,6 +140,7 @@ class BedrockTicketClassifier:
         self._model_id = model_id
         self._guardrail_id = guardrail_id
         self._guardrail_version = guardrail_version
+        self._telemetry_sink = telemetry_sink
 
     def classify(self, ticket: SupportTicket) -> TriageResult:
         started_at = time.perf_counter()
@@ -145,6 +151,14 @@ class BedrockTicketClassifier:
             )
 
         except (ClientError, BotoCoreError) as exc:
+
+            self._emit_telemetry(
+                outcome="unavailable",
+                response=None,
+                started_at=started_at,
+                stop_reason=None,
+            )
+
             self._log_event(
                 logging.WARNING,
                 "bedrock_classification_failed",
@@ -165,6 +179,13 @@ class BedrockTicketClassifier:
         )
 
         if stop_reason in BLOCKED_STOP_REASONS:
+            self._emit_telemetry(
+                outcome="blocked",
+                response=response,
+                started_at=started_at,
+                stop_reason=stop_reason,
+            )
+
             self._log_response_event(
                 logging.WARNING,
                 "bedrock_classification_blocked",
@@ -177,6 +198,13 @@ class BedrockTicketClassifier:
             )
 
         if stop_reason != "end_turn":
+            self._emit_telemetry(
+                outcome="incomplete",
+                response=response,
+                started_at=started_at,
+                stop_reason=stop_reason,
+            )
+
             self._log_response_event(
                 logging.WARNING,
                 "bedrock_classification_incomplete",
@@ -207,6 +235,13 @@ class BedrockTicketClassifier:
             )
 
         except ClassifierResponseError:
+            self._emit_telemetry(
+                outcome="invalid_response",
+                response=response,
+                started_at=started_at,
+                stop_reason=stop_reason,
+            )
+
             self._log_response_event(
                 logging.WARNING,
                 "bedrock_invalid_response",
@@ -216,6 +251,13 @@ class BedrockTicketClassifier:
             raise
 
         except (KeyError, TypeError, ValueError) as exc:
+            self._emit_telemetry(
+                outcome="invalid_response",
+                response=response,
+                started_at=started_at,
+                stop_reason=stop_reason,
+            )
+
             self._log_response_event(
                 logging.WARNING,
                 "bedrock_invalid_response",
@@ -226,6 +268,13 @@ class BedrockTicketClassifier:
             raise ClassifierResponseError(
                 "Bedrock returned an invalid classification response"
             ) from exc
+
+        self._emit_telemetry(
+            outcome="success",
+            response=response,
+            started_at=started_at,
+            stop_reason=stop_reason,
+        )
 
         self._log_response_event(
             logging.INFO,
@@ -392,6 +441,50 @@ class BedrockTicketClassifier:
 
         return type(exc).__name__
 
+    def _emit_telemetry(
+            self,
+            *,
+            outcome: str,
+            response: Mapping[str, Any] | None,
+            started_at: float,
+            stop_reason: str | None,
+    ) -> None:
+        if self._telemetry_sink is None:
+            return
+
+        usage: Mapping[str, Any] = {}
+        metrics: Mapping[str, Any] = {}
+
+        if response is not None:
+            raw_usage = response.get("usage", {})
+            raw_metrics = response.get("metrics", {})
+
+            if isinstance(raw_usage, Mapping):
+                usage = raw_usage
+
+            if isinstance(raw_metrics, Mapping):
+                metrics = raw_metrics
+
+        telemetry = ClassificationTelemetry(
+            outcome=outcome,
+            stop_reason=stop_reason,
+            input_tokens=usage.get("inputTokens"),
+            output_tokens=usage.get("outputTokens"),
+            total_tokens=usage.get("totalTokens"),
+            model_latency_ms=metrics.get("latencyMs"),
+            adapter_latency_ms=self._elapsed_ms(started_at),
+        )
+
+        try:
+            self._telemetry_sink.record(telemetry)
+
+        except Exception as exc:
+            self._log_event(
+                logging.ERROR,
+                "classification_telemetry_sink_failed",
+                error_type=type(exc).__name__,
+            )
+
 
 def create_bedrock_classifier(
     *,
@@ -399,6 +492,7 @@ def create_bedrock_classifier(
     region: str,
     guardrail_id: str | None = None,
     guardrail_version: str | None = None,
+    telemetry_sink: ClassificationTelemetrySink | None = None,
 ) -> BedrockTicketClassifier:
     config = Config(
         connect_timeout=5,
@@ -420,4 +514,5 @@ def create_bedrock_classifier(
         model_id=model_id,
         guardrail_id=guardrail_id,
         guardrail_version=guardrail_version,
+        telemetry_sink=telemetry_sink,
     )

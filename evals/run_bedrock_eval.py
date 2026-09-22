@@ -5,7 +5,6 @@ from pathlib import Path
 from app.adapters.aws.bedrock import create_bedrock_classifier
 from evals.triage_eval import load_eval_cases, run_eval
 
-
 DATASET = Path(
     "evals/datasets/ticket_triage_v1.jsonl"
 )
